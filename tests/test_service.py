@@ -156,6 +156,27 @@ def test_square_service_mp(mosec_service, http_client):
     assert_empty_queue(http_client)
 
 
+@pytest.mark.parametrize(
+    "mosec_service, http_client",
+    [
+        pytest.param("multi_route_service", "", id="route"),
+    ],
+    indirect=["mosec_service", "http_client"],
+)
+def test_multi_route_service(mosec_service, http_client):
+    resp: httpx.Response = http_client.post("/math/even", json={"num": 8})
+    assert resp.status_code == HTTPStatus.OK, resp
+    assert resp.json() == True
+
+    resp = http_client.post("/math/next", json={"num": 8})
+    assert resp.status_code == HTTPStatus.OK, resp
+    assert resp.json() == {"ans": 9}
+
+    resp = http_client.post("/ping", content=msgpack.packb({"num": 8}))
+    assert resp.status_code == HTTPStatus.OK, resp
+    assert msgpack.unpackb(resp.content) == "ok"
+
+
 def validate_square_service(http_client, x):
     resp = http_client.post("/inference", json={"x": x})
     assert resp.status_code == HTTPStatus.OK

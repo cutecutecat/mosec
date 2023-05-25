@@ -28,9 +28,16 @@ from os.path import join
 import msgpack  # type: ignore
 import pytest
 
-from mosec.coordinator import PROTOCOL_TIMEOUT, STAGE_EGRESS, STAGE_INGRESS, Coordinator
+from mosec.coordinator import (
+    PROTOCOL_TIMEOUT,
+    STAGE_EGRESS,
+    STAGE_INGRESS,
+    Coordinator,
+    standardize_to_socket,
+)
 from mosec.mixin import MsgpackMixin
 from mosec.protocol import HTTPStautsCode, _recv_all
+from mosec.server import DEFAULT_ROUTE
 from mosec.worker import Worker
 from tests.utils import imitate_controller_send
 
@@ -83,6 +90,7 @@ def base_test_config():
 def test_coordinator_worker_property():
     ctx = "spawn"
     c = Coordinator(
+        DEFAULT_ROUTE,
         EchoWorkerJSON,
         max_batch_size=16,
         stage=STAGE_EGRESS,
@@ -99,10 +107,11 @@ def test_coordinator_worker_property():
     assert c.worker.max_batch_size == 16
 
 
-def make_coordinator_process(w_cls, c_ctx, shutdown, shutdown_notify, config):
+def make_coordinator_process(route, w_cls, c_ctx, shutdown, shutdown_notify, config):
     return mp.get_context(c_ctx).Process(
         target=Coordinator,
         args=(
+            route,
             w_cls,
             config["max_batch_size"],
             stage,
@@ -129,6 +138,7 @@ def test_socket_file_not_found(mocker, base_test_config, caplog):
     with CleanDirContext():
         with caplog.at_level(logging.ERROR):
             _ = Coordinator(
+                DEFAULT_ROUTE,
                 EchoWorkerJSON,
                 stage=stage,
                 shutdown=shutdown,
@@ -145,7 +155,8 @@ def test_incorrect_socket_file(mocker, base_test_config, caplog):
     mocker.patch("mosec.coordinator.CONN_MAX_RETRY", 5)
     mocker.patch("mosec.coordinator.CONN_CHECK_INTERVAL", 0.01)
 
-    sock_addr = join(socket_prefix, f"ipc_{base_test_config.get('stage_id')}.socket")
+    endpoint = standardize_to_socket(DEFAULT_ROUTE, base_test_config.get("stage_id"))
+    sock_addr = join(socket_prefix, endpoint)
     c_ctx = base_test_config.pop("c_ctx")
     shutdown = mp.get_context(c_ctx).Event()
     shutdown_notify = mp.get_context(c_ctx).Event()
@@ -157,6 +168,7 @@ def test_incorrect_socket_file(mocker, base_test_config, caplog):
 
         with caplog.at_level(logging.ERROR):
             _ = Coordinator(
+                DEFAULT_ROUTE,
                 EchoWorkerJSON,
                 stage=stage,
                 shutdown=shutdown,
@@ -177,6 +189,7 @@ def test_incorrect_socket_file(mocker, base_test_config, caplog):
         with caplog.at_level(logging.ERROR):
             # with pytest.raises(RuntimeError, match=r".*Connection refused.*"):
             _ = Coordinator(
+                DEFAULT_ROUTE,
                 EchoWorkerJSON,
                 stage=stage,
                 shutdown=shutdown,
@@ -225,7 +238,8 @@ def test_echo_batch(base_test_config, test_data, worker, deserializer):
     # knows this stage enables batching
     base_test_config["max_batch_size"] = 8
 
-    sock_addr = join(socket_prefix, f"ipc_{base_test_config.get('stage_id')}.socket")
+    endpoint = standardize_to_socket(DEFAULT_ROUTE, base_test_config.get("stage_id"))
+    sock_addr = join(socket_prefix, endpoint)
     shutdown = mp.get_context(c_ctx).Event()
     shutdown_notify = mp.get_context(c_ctx).Event()
 
@@ -237,6 +251,7 @@ def test_echo_batch(base_test_config, test_data, worker, deserializer):
         sock.listen()
 
         coordinator_process = make_coordinator_process(
+            DEFAULT_ROUTE,
             worker,
             c_ctx,
             shutdown,
