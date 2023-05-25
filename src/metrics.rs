@@ -27,6 +27,7 @@ pub struct CodeLabel {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StageConnectionLabel {
+    pub endpoint: String,
     pub stage: String,
     pub connection: String,
 }
@@ -80,6 +81,7 @@ impl Metrics {
     pub(crate) fn init_with_namespace(namespace: &str, timeout: u64) -> Self {
         DURATION_LABEL
             .set(StageConnectionLabel {
+                endpoint: "total".to_string(),
                 stage: "total".to_string(),
                 connection: "total".to_string(),
             })

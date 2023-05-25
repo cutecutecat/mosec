@@ -23,6 +23,7 @@ use tokio::sync::oneshot;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use crate::args::Endpoint;
 use crate::errors::ServiceError;
 use crate::metrics::Metrics;
 
@@ -59,11 +60,12 @@ impl Task {
 
 #[derive(Debug)]
 pub(crate) struct TaskManager {
-    table: RwLock<HashMap<u32, Task>>,
-    notifiers: Mutex<HashMap<u32, oneshot::Sender<()>>>,
+    endpoints: Vec<Endpoint>,
+    table: HashMap<Endpoint, RwLock<HashMap<u32, Task>>>,
+    notifiers: HashMap<Endpoint, Mutex<HashMap<u32, oneshot::Sender<()>>>>,
     timeout: Duration,
     current_id: Mutex<u32>,
-    channel: async_channel::Sender<u32>,
+    channels: HashMap<Endpoint, async_channel::Sender<u32>>,
     shutdown: AtomicBool,
 }
 
@@ -74,13 +76,24 @@ impl TaskManager {
         TASK_MANAGER.get().expect("task manager is not initialized")
     }
 
-    pub(crate) fn new(timeout: Duration, channel: async_channel::Sender<u32>) -> Self {
+    pub(crate) fn new(
+        timeout: Duration,
+        endpoints: Vec<Endpoint>,
+        channels: HashMap<Endpoint, async_channel::Sender<u32>>,
+    ) -> Self {
         Self {
-            table: RwLock::new(HashMap::new()),
-            notifiers: Mutex::new(HashMap::new()),
+            endpoints: endpoints.clone(),
+            table: endpoints
+                .iter()
+                .map(|e| (e.clone(), RwLock::new(HashMap::new())))
+                .collect(),
+            notifiers: endpoints
+                .iter()
+                .map(|e| (e.clone(), Mutex::new(HashMap::new())))
+                .collect(),
             timeout,
             current_id: Mutex::new(0),
-            channel,
+            channels,
             shutdown: AtomicBool::new(false),
         }
     }
@@ -89,10 +102,13 @@ impl TaskManager {
         self.shutdown.store(true, Ordering::Release);
         let fut = time::timeout(self.timeout, async {
             let mut interval = time::interval(Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                if self.table.read().unwrap().len() == 0 {
-                    break;
+            for e in &self.endpoints {
+                loop {
+                    interval.tick().await;
+                    let lock = self.table.get(e).unwrap();
+                    if lock.read().unwrap().len() == 0 {
+                        break;
+                    }
                 }
             }
         });
@@ -101,21 +117,27 @@ impl TaskManager {
         }
     }
 
-    pub(crate) async fn submit_task(&self, data: Bytes) -> Result<Task, ServiceError> {
-        let (id, rx) = self.add_new_task(data)?;
+    pub(crate) async fn submit_task(
+        &self,
+        data: Bytes,
+        endpoint: &Endpoint,
+    ) -> Result<Task, ServiceError> {
+        let (id, rx) = self.add_new_task(data, endpoint)?;
+        let notifier_lock = self.notifiers.get(endpoint).unwrap();
+        let table_lock = self.table.get(endpoint).unwrap();
         if let Err(err) = time::timeout(self.timeout, rx).await {
             warn!(%id, %err, "task was not completed in the expected time");
             {
-                let mut notifiers = self.notifiers.lock().unwrap();
+                let mut notifiers = notifier_lock.lock().unwrap();
                 notifiers.remove(&id);
             }
             {
-                let mut table = self.table.write().unwrap();
+                let mut table = table_lock.write().unwrap();
                 table.remove(&id);
             }
             return Err(ServiceError::Timeout);
         }
-        let mut table = self.table.write().unwrap();
+        let mut table = self.table.get(endpoint).unwrap().write().unwrap();
         match table.remove(&id) {
             Some(task) => Ok(task),
             None => {
@@ -129,7 +151,13 @@ impl TaskManager {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    fn add_new_task(&self, data: Bytes) -> Result<(u32, oneshot::Receiver<()>), ServiceError> {
+    fn add_new_task(
+        &self,
+        data: Bytes,
+        endpoint: &Endpoint,
+    ) -> Result<(u32, oneshot::Receiver<()>), ServiceError> {
+        let notifier_lock = self.notifiers.get(endpoint).unwrap();
+        let table_lock = self.table.get(endpoint).unwrap();
         let (tx, rx) = oneshot::channel();
         let id: u32;
         {
@@ -138,23 +166,24 @@ impl TaskManager {
             *current_id = id.wrapping_add(1);
         }
         {
-            let mut notifiers = self.notifiers.lock().unwrap();
+            let mut notifiers = notifier_lock.lock().unwrap();
             notifiers.insert(id, tx);
         }
         {
-            let mut table = self.table.write().unwrap();
+            let mut table = table_lock.write().unwrap();
             table.insert(id, Task::new(data));
         }
         debug!(%id, "add a new task");
 
-        if self.channel.try_send(id).is_err() {
+        let channel = self.channels.get(endpoint).unwrap();
+        if channel.try_send(id).is_err() {
             warn!(%id, "reach the capacity limit, will delete this task");
             {
-                let mut notifiers = self.notifiers.lock().unwrap();
+                let mut notifiers = notifier_lock.lock().unwrap();
                 notifiers.remove(&id);
             }
             {
-                let mut table = self.table.write().unwrap();
+                let mut table = table_lock.write().unwrap();
                 table.remove(&id);
             }
             return Err(ServiceError::TooManyRequests);
@@ -162,10 +191,12 @@ impl TaskManager {
         Ok((id, rx))
     }
 
-    pub(crate) fn notify_task_done(&self, id: u32) {
+    pub(crate) fn notify_task_done(&self, id: u32, endpoint: &Endpoint) {
+        let notifier_lock = self.notifiers.get(endpoint).unwrap();
+        let table_lock = self.table.get(endpoint).unwrap();
         let res;
         {
-            let mut notifiers = self.notifiers.lock().unwrap();
+            let mut notifiers = notifier_lock.lock().unwrap();
             res = notifiers.remove(&id);
         }
         if let Some(sender) = res {
@@ -175,7 +206,7 @@ impl TaskManager {
                 warn!(%id, "the task notifier is already closed, will delete it \
                     (this is usually because the client side has closed the connection)");
                 {
-                    let mut table = self.table.write().unwrap();
+                    let mut table = table_lock.write().unwrap();
                     table.remove(&id);
                 }
                 let metrics = Metrics::global();
@@ -187,8 +218,14 @@ impl TaskManager {
         }
     }
 
-    pub(crate) fn get_multi_tasks_data(&self, ids: &mut Vec<u32>, data: &mut Vec<Bytes>) {
-        let table = self.table.read().unwrap();
+    pub(crate) fn get_multi_tasks_data(
+        &self,
+        ids: &mut Vec<u32>,
+        data: &mut Vec<Bytes>,
+        endpoint: &Endpoint,
+    ) {
+        let table_lock = self.table.get(endpoint).unwrap();
+        let table = table_lock.read().unwrap();
         // delete the task_id if the task_id doesn't exist in the table
         ids.retain(|&id| match table.get(&id) {
             Some(task) => {
@@ -199,8 +236,15 @@ impl TaskManager {
         });
     }
 
-    pub(crate) fn update_multi_tasks(&self, code: TaskCode, ids: &[u32], data: &[Bytes]) {
-        let mut table = self.table.write().unwrap();
+    pub(crate) fn update_multi_tasks(
+        &self,
+        code: TaskCode,
+        ids: &[u32],
+        data: &[Bytes],
+        endpoint: &Endpoint,
+    ) {
+        let table_lock = self.table.get(endpoint).unwrap();
+        let mut table = table_lock.write().unwrap();
         let mut abnormal_tasks = Vec::new();
         for i in 0..ids.len() {
             let task = table.get_mut(&ids[i]);
@@ -224,14 +268,18 @@ impl TaskManager {
         // the notifiers lock, we'd better only hold one lock at a time
         drop(table);
         for task_id in abnormal_tasks {
-            self.notify_task_done(task_id);
+            self.notify_task_done(task_id, endpoint);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use once_cell::unsync::Lazy;
+
     use super::*;
+
+    const DEFAULT_ENDPOINT: Lazy<Endpoint> = Lazy::new(|| Endpoint::new("/inference"));
 
     #[test]
     fn create_and_update_task() {
@@ -250,13 +298,23 @@ mod tests {
     #[tokio::test]
     async fn task_manager_add_new_task() {
         let (tx, rx) = async_channel::bounded(1);
-        let task_manager = TaskManager::new(Duration::from_secs(1), tx);
+        let channels = HashMap::from([(DEFAULT_ENDPOINT.clone(), tx)]);
+        let task_manager = TaskManager::new(
+            Duration::from_secs(1),
+            Vec::from([DEFAULT_ENDPOINT.clone()]),
+            channels,
+        );
         let (id, _rx) = task_manager
-            .add_new_task(Bytes::from_static(b"hello"))
+            .add_new_task(Bytes::from_static(b"hello"), &DEFAULT_ENDPOINT)
             .unwrap();
         assert_eq!(id, 0);
         {
-            let table = task_manager.table.read().unwrap();
+            let table = task_manager
+                .table
+                .get(&DEFAULT_ENDPOINT)
+                .unwrap()
+                .read()
+                .unwrap();
             let task = table.get(&id).unwrap();
             assert_eq!(task.data, Bytes::from_static(b"hello"));
         }
@@ -265,11 +323,16 @@ mod tests {
 
         // add a new task
         let (id, _rx) = task_manager
-            .add_new_task(Bytes::from_static(b"world"))
+            .add_new_task(Bytes::from_static(b"world"), &DEFAULT_ENDPOINT)
             .unwrap();
         assert_eq!(id, 1);
         {
-            let table = task_manager.table.read().unwrap();
+            let table = task_manager
+                .table
+                .get(&DEFAULT_ENDPOINT)
+                .unwrap()
+                .read()
+                .unwrap();
             let task = table.get(&id).unwrap();
             assert_eq!(task.data, Bytes::from_static(b"world"));
         }
@@ -280,38 +343,67 @@ mod tests {
     #[tokio::test]
     async fn task_manager_timeout() {
         let (tx, _rx) = async_channel::bounded(1);
-        let task_manager = TaskManager::new(Duration::from_millis(1), tx);
+        let channels = HashMap::from([(DEFAULT_ENDPOINT.clone(), tx)]);
+        let task_manager = TaskManager::new(
+            Duration::from_millis(1),
+            Vec::from([DEFAULT_ENDPOINT.clone()]),
+            channels,
+        );
 
         // wait until this task timeout
-        let res = task_manager.submit_task(Bytes::from_static(b"hello")).await;
+        let res = task_manager
+            .submit_task(Bytes::from_static(b"hello"), &DEFAULT_ENDPOINT)
+            .await;
         assert!(matches!(res.unwrap_err(), ServiceError::Timeout));
     }
 
     #[tokio::test]
     async fn task_manager_too_many_request() {
         let (tx, _rx) = async_channel::bounded(1);
+        let channels = HashMap::from([(DEFAULT_ENDPOINT.clone(), tx.clone())]);
         // push one task into the channel to make the channel full
         let _ = tx.send(0u32).await;
-        let task_manager = TaskManager::new(Duration::from_millis(1), tx);
+        let task_manager = TaskManager::new(
+            Duration::from_millis(1),
+            Vec::from([DEFAULT_ENDPOINT.clone()]),
+            channels,
+        );
 
         // trigger too many request since the capacity is 0
-        let res = task_manager.submit_task(Bytes::from_static(b"hello")).await;
+        let res = task_manager
+            .submit_task(Bytes::from_static(b"hello"), &DEFAULT_ENDPOINT)
+            .await;
         assert!(matches!(res.unwrap_err(), ServiceError::TooManyRequests));
     }
 
     #[tokio::test]
     async fn task_manager_graceful_shutdown() {
         let (tx, _rx) = async_channel::bounded(1);
-        let task_manager = TaskManager::new(Duration::from_millis(1), tx);
+        let channels = HashMap::from([(DEFAULT_ENDPOINT.clone(), tx)]);
+        let task_manager = TaskManager::new(
+            Duration::from_millis(1),
+            Vec::from([DEFAULT_ENDPOINT.clone()]),
+            channels,
+        );
         assert!(!task_manager.is_shutdown());
         task_manager.shutdown().await;
         assert!(task_manager.is_shutdown());
 
         let (tx, _rx) = async_channel::bounded(1);
-        let task_manager = TaskManager::new(Duration::from_millis(10), tx);
+        let channels = HashMap::from([(DEFAULT_ENDPOINT.clone(), tx)]);
+        let task_manager = TaskManager::new(
+            Duration::from_millis(10),
+            Vec::from([DEFAULT_ENDPOINT.clone()]),
+            channels,
+        );
         {
             // block with one task in the channel
-            let mut table = task_manager.table.write().unwrap();
+            let mut table = task_manager
+                .table
+                .get(&DEFAULT_ENDPOINT)
+                .unwrap()
+                .write()
+                .unwrap();
             table.insert(0u32, Task::new(Bytes::from_static(b"hello")));
         }
         assert!(!task_manager.is_shutdown());
@@ -325,18 +417,28 @@ mod tests {
     #[tokio::test]
     async fn task_manager_get_and_update_task() {
         let (tx, _rx) = async_channel::bounded(1);
-        let task_manager = TaskManager::new(Duration::from_millis(1), tx);
+        let channels = HashMap::from([(DEFAULT_ENDPOINT.clone(), tx)]);
+        let task_manager = TaskManager::new(
+            Duration::from_millis(1),
+            Vec::from([DEFAULT_ENDPOINT.clone()]),
+            channels,
+        );
 
         // add some tasks to the table
         {
-            let mut table = task_manager.table.write().unwrap();
+            let mut table = task_manager
+                .table
+                .get(&DEFAULT_ENDPOINT)
+                .unwrap()
+                .write()
+                .unwrap();
             table.insert(0, Task::new(Bytes::from_static(b"hello")));
             table.insert(1, Task::new(Bytes::from_static(b"world")));
         }
 
         let mut task_ids = vec![0, 1, 2];
         let mut data = Vec::new();
-        task_manager.get_multi_tasks_data(&mut task_ids, &mut data);
+        task_manager.get_multi_tasks_data(&mut task_ids, &mut data, &DEFAULT_ENDPOINT);
         assert_eq!(task_ids, vec![0, 1]);
         assert_eq!(
             data,
@@ -345,13 +447,76 @@ mod tests {
 
         // update tasks
         data = vec![Bytes::from_static(b"rust"), Bytes::from_static(b"tokio")];
-        task_manager.update_multi_tasks(TaskCode::Normal, &task_ids, &data);
+        task_manager.update_multi_tasks(TaskCode::Normal, &task_ids, &data, &DEFAULT_ENDPOINT);
         let mut new_data = Vec::new();
-        task_manager.get_multi_tasks_data(&mut task_ids, &mut new_data);
+        task_manager.get_multi_tasks_data(&mut task_ids, &mut new_data, &DEFAULT_ENDPOINT);
         assert_eq!(task_ids, vec![0, 1]);
         assert_eq!(
             new_data,
             vec![Bytes::from_static(b"rust"), Bytes::from_static(b"tokio")]
         );
+    }
+
+    #[tokio::test]
+    async fn task_manager_get_and_update_task_multi_route() {
+        let endpoint_image = Endpoint::new("/infer/image");
+        let endpoint_text = Endpoint::new("/infer/text");
+        let (tx_img, _rx_img) = async_channel::bounded(1);
+        let (tx_text, _rx_text) = async_channel::bounded(1);
+        let channels = HashMap::from([
+            (endpoint_image.clone(), tx_img),
+            (endpoint_text.clone(), tx_text),
+        ]);
+        let task_manager = TaskManager::new(
+            Duration::from_millis(1),
+            Vec::from([endpoint_image.clone(), endpoint_text.clone()]),
+            channels,
+        );
+
+        // add some tasks to the table
+        {
+            let mut table_img = task_manager
+                .table
+                .get(&endpoint_image)
+                .unwrap()
+                .write()
+                .unwrap();
+            table_img.insert(0, Task::new(Bytes::from_static(b"image_dog")));
+            table_img.insert(1, Task::new(Bytes::from_static(b"image_cat")));
+        }
+        {
+            let mut table_text = task_manager
+                .table
+                .get(&endpoint_text)
+                .unwrap()
+                .write()
+                .unwrap();
+            table_text.insert(0, Task::new(Bytes::from_static(b"text_pig")));
+        }
+
+        let mut task_ids = vec![0, 1, 2];
+        let mut data = Vec::new();
+        task_manager.get_multi_tasks_data(&mut task_ids, &mut data, &endpoint_image);
+        assert_eq!(task_ids, vec![0, 1]);
+        assert_eq!(
+            data,
+            vec![
+                Bytes::from_static(b"image_dog"),
+                Bytes::from_static(b"image_cat")
+            ]
+        );
+        data = Vec::new();
+        task_manager.get_multi_tasks_data(&mut task_ids, &mut data, &endpoint_text);
+        assert_eq!(task_ids, vec![0]);
+        assert_eq!(data, vec![Bytes::from_static(b"text_pig")]);
+
+        // update tasks
+        task_ids = vec![0];
+        data = vec![Bytes::from_static(b"text_sheep")];
+        task_manager.update_multi_tasks(TaskCode::Normal, &task_ids, &data, &endpoint_text);
+        let mut new_data = Vec::new();
+        task_manager.get_multi_tasks_data(&mut task_ids, &mut new_data, &endpoint_text);
+        assert_eq!(task_ids, vec![0]);
+        assert_eq!(new_data, data);
     }
 }

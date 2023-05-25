@@ -21,10 +21,9 @@ use async_channel::{bounded, Receiver, Sender};
 use tokio::sync::Barrier;
 use tracing::{error, info};
 
-use crate::args::Opts;
-use crate::metrics::{Metrics, METRICS};
+use crate::args::Endpoint;
 use crate::protocol::communicate;
-use crate::tasks::{TaskManager, TASK_MANAGER};
+use crate::tasks::TaskManager;
 
 #[derive(Debug)]
 pub(crate) struct Coordinator {
@@ -37,17 +36,17 @@ pub(crate) struct Coordinator {
 }
 
 impl Coordinator {
-    pub(crate) fn init_from_opts(opts: &Opts) -> Self {
-        // init the global task manager
-        let (sender, receiver) = bounded(opts.capacity);
-        let timeout = Duration::from_millis(opts.timeout);
-        let wait_time = opts
-            .waits
-            .iter()
-            .map(|x| Duration::from_millis(*x))
-            .collect();
-        let path = if !opts.path.is_empty() {
-            opts.path.to_string()
+    pub(crate) fn init(
+        batches: Vec<u32>,
+        waits: Vec<u64>,
+        path: String,
+        capacity: usize,
+        sender: Sender<u32>,
+        receiver: Receiver<u32>,
+    ) -> Self {
+        let wait_time = waits.iter().map(|x| Duration::from_millis(*x)).collect();
+        let path = if !path.is_empty() {
+            path.to_string()
         } else {
             // default IPC path
             std::env::temp_dir()
@@ -56,22 +55,18 @@ impl Coordinator {
                 .into_string()
                 .unwrap()
         };
-        let task_manager = TaskManager::new(timeout, sender.clone());
-        TASK_MANAGER.set(task_manager).unwrap();
-        let metrics = Metrics::init_with_namespace(&opts.namespace, opts.timeout);
-        METRICS.set(metrics).unwrap();
 
         Self {
-            capacity: opts.capacity,
+            capacity: capacity,
             path,
-            batches: opts.batches.clone(),
+            batches: batches,
             wait_time,
             receiver,
             sender,
         }
     }
 
-    pub(crate) fn run(&self) -> Arc<Barrier> {
+    pub(crate) fn run(&self, endpoint: Endpoint) -> Arc<Barrier> {
         let barrier = Arc::new(Barrier::new(self.batches.len() + 1));
         let mut last_receiver = self.receiver.clone();
         let mut last_sender = self.sender.clone();
@@ -84,11 +79,12 @@ impl Coordinator {
 
         for i in 0..self.batches.len() {
             let (sender, receiver) = bounded::<u32>(self.capacity);
-            let path = folder.join(format!("ipc_{:?}.socket", i + 1));
+            let path = folder.join(endpoint.standardize_to_socket(i + 1));
 
             let batch_size = self.batches[i];
             let wait = self.wait_time[i];
             tokio::spawn(communicate(
+                endpoint.clone(),
                 path,
                 batch_size as usize,
                 wait,
@@ -101,17 +97,17 @@ impl Coordinator {
             last_receiver = receiver;
             last_sender = sender;
         }
-        tokio::spawn(finish_task(last_receiver));
+        tokio::spawn(finish_task(last_receiver, endpoint));
         barrier
     }
 }
 
-async fn finish_task(receiver: Receiver<u32>) {
+async fn finish_task(receiver: Receiver<u32>, endpoint: Endpoint) {
     let task_manager = TaskManager::global();
     loop {
         match receiver.recv().await {
             Ok(id) => {
-                task_manager.notify_task_done(id);
+                task_manager.notify_task_done(id, &endpoint);
             }
             Err(err) => {
                 error!(%err, "failed to get the task id when trying to mark it as done");

@@ -25,3 +25,9 @@ pub(crate) enum ServiceError {
     #[display(fmt = "mosec unknown error")]
     UnknownError,
 }
+
+#[derive(Debug, Display, derive_more::Error)]
+pub(crate) enum SystemError {
+    #[display(fmt = "mosec argument validation failed: {}", msg)]
+    ArgsValidationFailed { msg: String },
+}

@@ -23,6 +23,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Barrier;
 use tracing::{debug, error, info, warn};
 
+use crate::args::Endpoint;
 use crate::metrics::{Metrics, StageConnectionLabel};
 use crate::tasks::{TaskCode, TaskManager};
 
@@ -39,6 +40,7 @@ const BIT_STATUS_TIMEOUT_ERR: u16 = 0b10000;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn communicate(
+    endpoint: Endpoint,
     path: PathBuf,
     batch_size: usize,
     wait_time: Duration,
@@ -52,6 +54,7 @@ pub(crate) async fn communicate(
     let mut connection_id: u32 = 0;
     loop {
         connection_id += 1;
+        let endpoint = endpoint.clone();
         let sender_clone = sender.clone();
         let last_sender_clone = last_sender.clone();
         let receiver_clone = receiver.clone();
@@ -59,7 +62,7 @@ pub(crate) async fn communicate(
         let connection_id_label = connection_id.to_string();
         match listener.accept().await {
             Ok((mut stream, addr)) => {
-                info!(?addr, "socket accepted connection from");
+                info!(?endpoint, ?addr, "socket accepted connection from");
                 tokio::spawn(async move {
                     let mut code: TaskCode = TaskCode::InternalError;
                     let mut ids: Vec<u32> = Vec::with_capacity(batch_size);
@@ -67,9 +70,11 @@ pub(crate) async fn communicate(
                     let task_manager = TaskManager::global();
                     let metrics = Metrics::global();
                     let metric_label = StageConnectionLabel {
+                        endpoint: endpoint.path().to_string(),
                         stage: stage_id_label,
                         connection: connection_id_label,
                     };
+
                     loop {
                         ids.clear();
                         data.clear();
@@ -84,7 +89,7 @@ pub(crate) async fn communicate(
                         // start record the duration metrics here because receiving the first task
                         // depends on when the request comes in.
                         let start_timer = Instant::now();
-                        task_manager.get_multi_tasks_data(&mut ids, &mut data);
+                        task_manager.get_multi_tasks_data(&mut ids, &mut data, &endpoint);
                         if data.is_empty() {
                             continue;
                         }
@@ -114,7 +119,7 @@ pub(crate) async fn communicate(
                             error!(%err, %connection_id, "socket receive message error");
                             break;
                         }
-                        task_manager.update_multi_tasks(code, &ids, &data);
+                        task_manager.update_multi_tasks(code, &ids, &data, &endpoint);
                         match code {
                             TaskCode::Normal => {
                                 for id in &ids {
