@@ -63,6 +63,26 @@ def set_mosec_timeout(duration: int):
         signal.alarm(0)
 
 
+def standardize_to_socket(endpoint: str, stage_id: int):
+    """Standardize routes url into socket file descriptor path.
+
+    Args:
+        endpoint (str): url of endpoint
+        stage_id (int): identification number for worker stages.
+
+    Examples:
+        >>> standardize_to_socket("/", 0)
+        'ipc__0.socket'
+        >>> standardize_to_socket("/image", 1)
+        'ipc_image_1.socket'
+        >>> standardize_to_socket("/a/cat", 2)
+        'ipc_a+cat_2.socket'
+
+    """
+    standard_endpoint = endpoint.strip("/").replace("/", "+")
+    return f"ipc_{standard_endpoint}_{stage_id}.socket"
+
+
 class Coordinator:
     """Coordinator controls the data flow.
 
@@ -73,6 +93,7 @@ class Coordinator:
     # pylint: disable=too-many-arguments
     def __init__(
         self,
+        endpoint: str,
         worker: Type[Worker],
         max_batch_size: int,
         stage: str,
@@ -107,11 +128,11 @@ class Coordinator:
         self.worker.max_batch_size = max_batch_size
         self.worker.stage = stage
         self.timeout = timeout
-        self.name = f"<{stage_id}|{worker.__name__}|{worker_id}>"
+        self.name = f"<{endpoint}|{stage_id}|{worker.__name__}|{worker_id}>"
 
         self.protocol = Protocol(
             name=self.name,
-            addr=os.path.join(socket_prefix, f"ipc_{stage_id}.socket"),
+            addr=os.path.join(socket_prefix, standardize_to_socket(endpoint, stage_id)),
             timeout=PROTOCOL_TIMEOUT,
         )
 

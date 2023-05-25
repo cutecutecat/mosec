@@ -58,6 +58,7 @@ from mosec.dry_run import DryRunner
 from mosec.env import env_var_context
 from mosec.ipc import IPCWrapper
 from mosec.log import get_internal_logger
+from mosec.route import Route
 from mosec.worker import Worker
 
 logger = get_internal_logger()
@@ -65,6 +66,8 @@ logger = get_internal_logger()
 
 GUARD_CHECK_INTERVAL = 1
 NEW_PROCESS_METHOD = {"spawn", "fork"}
+DEFAULT_ROUTE = "/inference"
+RESERVED_ROUTEE = set(["/", "/metrics"])
 
 
 class Server:
@@ -84,17 +87,20 @@ class Server:
         Args:
             ipc_wrapper: wrapper function (before and after) IPC
         """
+        self.route_path = DEFAULT_ROUTE
         self.ipc_wrapper = ipc_wrapper
 
-        self._worker_cls: List[Type[Worker]] = []
-        self._worker_num: List[int] = []
-        self._worker_mbs: List[int] = []
-        self._worker_wait: List[int] = []
-        self._worker_timeout: List[int] = []
+        self.endpoints: List[str] = []
+        # List index: endpoint_name -> stage_id -> worker_id(Optional)
+        self._worker_cls: Dict[str, List[Type[Worker]]] = {}
+        self._worker_num: Dict[str, List[int]] = {}
+        self._worker_mbs: Dict[str, List[int]] = {}
+        self._worker_wait: Dict[str, List[int]] = {}
+        self._worker_timeout: Dict[str, List[int]] = {}
 
-        self._coordinator_env: List[Union[None, List[Dict[str, str]]]] = []
-        self._coordinator_ctx: List[str] = []
-        self._coordinator_pools: List[List[Union[mp.Process, None]]] = []
+        self._coordinator_env: Dict[str, List[Union[None, List[Dict[str, str]]]]] = {}
+        self._coordinator_ctx: Dict[str, List[str]] = {}
+        self._coordinator_pools: Dict[str, List[List[Union[mp.Process, None]]]] = {}
         self._coordinator_shutdown: Event = mp.get_context("spawn").Event()
         self._coordinator_shutdown_notify: Event = mp.get_context("spawn").Event()
 
@@ -116,8 +122,10 @@ class Server:
             "help: use `.append_worker(...)` to register at least one worker"
         )
 
+    # pylint: disable=too-many-arguments
     @staticmethod
     def _validate_arguments(
+        endpoint,
         worker,
         num,
         max_batch_size,
@@ -126,6 +134,11 @@ class Server:
         env,
         timeout,
     ):
+        def validate_route():
+            assert (
+                endpoint not in RESERVED_ROUTEE
+            ), f"{endpoint} is reserved, change to another one"
+
         def validate_int_ge(number, name, threshold=1):
             assert isinstance(
                 number, int
@@ -150,6 +163,7 @@ class Server:
                 valid = False
             assert valid, "env must be a list of string dictionary"
 
+        validate_route()
         validate_env()
         assert issubclass(worker, Worker), "worker must be inherited from mosec.Worker"
         validate_int_ge(num, "worker number")
@@ -181,14 +195,17 @@ class Server:
         self._configs.pop("dry_run")
         for key, value in self._configs.items():
             args.extend([f"--{key}", str(value).lower()])
-        for batch_size in self._worker_mbs:
-            args.extend(["--batches", str(batch_size)])
-        for wait_time in self._worker_wait:
-            args.extend(
-                ["--waits", str(wait_time if wait_time else self._configs["wait"])]
-            )
-        mime_type = self._worker_cls[-1].resp_mime_type
-        args.extend(["--mime", mime_type])
+        for endpoint in self.endpoints:
+            args.extend(["--endpoints", endpoint])
+            args.extend(["--stages", str(len(self._worker_mbs[endpoint]))])
+            for batch_size in self._worker_mbs[endpoint]:
+                args.extend(["--batches", str(batch_size)])
+            for wait_time in self._worker_wait[endpoint]:
+                args.extend(
+                    ["--waits", str(wait_time if wait_time else self._configs["wait"])]
+                )
+            mime_type = self._worker_cls[endpoint][-1].resp_mime_type
+            args.extend(["--mime", mime_type])
         logger.info("mosec received arguments: %s", args)
         return args
 
@@ -215,72 +232,83 @@ class Server:
                 processes[i] = None
         return processes
 
-    def _manage_coordinators(self):
-        first = True
-        while not self._server_shutdown:
-            for stage_id, (w_cls, w_num, w_mbs, w_timeout, c_ctx, c_env) in enumerate(
-                zip(
-                    self._worker_cls,
-                    self._worker_num,
-                    self._worker_mbs,
-                    self._worker_timeout,
-                    self._coordinator_ctx,
-                    self._coordinator_env,
-                )
-            ):
-                # for every sequential stage
-                self._coordinator_pools[stage_id] = self._clean_pools(
-                    self._coordinator_pools[stage_id]
-                )
+    def _manage_coordinators_endpoint(self, endpoint: str, first: bool):
+        for stage_id, (
+            w_cls,
+            w_num,
+            w_mbs,
+            w_timeout,
+            c_ctx,
+            c_env,
+        ) in enumerate(
+            zip(
+                self._worker_cls[endpoint],
+                self._worker_num[endpoint],
+                self._worker_mbs[endpoint],
+                self._worker_timeout[endpoint],
+                self._coordinator_ctx[endpoint],
+                self._coordinator_env[endpoint],
+            )
+        ):
+            # for every sequential stage
+            self._coordinator_pools[endpoint][stage_id] = self._clean_pools(
+                self._coordinator_pools[endpoint][stage_id]
+            )
 
-                if all(self._coordinator_pools[stage_id]):
-                    # this stage is healthy
+            if all(self._coordinator_pools[endpoint][stage_id]):
+                # this stage is healthy
+                continue
+            if not first and not any(self._coordinator_pools[endpoint][stage_id]):
+                # this stage might contain bugs
+                self._terminate(
+                    1,
+                    f"all the {w_cls.__name__} workers at stage {stage_id} exited;"
+                    " please check for bugs or socket connection issues",
+                )
+                break
+            stage = ""
+            if stage_id == 0:
+                stage += STAGE_INGRESS
+            if stage_id == len(self._worker_cls[endpoint]) - 1:
+                stage += STAGE_EGRESS
+            for worker_id in range(w_num):
+                # for every worker in each stage
+                if self._coordinator_pools[endpoint][stage_id][worker_id] is not None:
                     continue
 
-                if not first and not any(self._coordinator_pools[stage_id]):
-                    # this stage might contain bugs
-                    self._terminate(
-                        1,
-                        f"all the {w_cls.__name__} workers at stage {stage_id} exited;"
-                        " please check for bugs or socket connection issues",
-                    )
-                    break
+                coordinator_process = mp.get_context(c_ctx).Process(  # type: ignore
+                    target=Coordinator,
+                    args=(
+                        endpoint,
+                        w_cls,
+                        w_mbs,
+                        stage,
+                        self._coordinator_shutdown,
+                        self._coordinator_shutdown_notify,
+                        self._configs["path"],
+                        stage_id + 1,
+                        worker_id + 1,
+                        self.ipc_wrapper,
+                        w_timeout,
+                    ),
+                    daemon=True,
+                )
 
-                stage = ""
-                if stage_id == 0:
-                    stage += STAGE_INGRESS
-                if stage_id == len(self._worker_cls) - 1:
-                    stage += STAGE_EGRESS
+                with env_var_context(c_env, worker_id):
+                    coordinator_process.start()
 
-                for worker_id in range(w_num):
-                    # for every worker in each stage
-                    if self._coordinator_pools[stage_id][worker_id] is not None:
-                        continue
+                self._coordinator_pools[endpoint][stage_id][
+                    worker_id
+                ] = coordinator_process
 
-                    coordinator_process = mp.get_context(c_ctx).Process(  # type: ignore
-                        target=Coordinator,
-                        args=(
-                            w_cls,
-                            w_mbs,
-                            stage,
-                            self._coordinator_shutdown,
-                            self._coordinator_shutdown_notify,
-                            self._configs["path"],
-                            stage_id + 1,
-                            worker_id + 1,
-                            self.ipc_wrapper,
-                            w_timeout,
-                        ),
-                        daemon=True,
-                    )
-
-                    with env_var_context(c_env, worker_id):
-                        coordinator_process.start()
-
-                    self._coordinator_pools[stage_id][worker_id] = coordinator_process
-            first = False
-            self._check_daemon()
-            sleep(GUARD_CHECK_INTERVAL)
+    def _manage_coordinators(self):
+        first = {e: True for e in self.endpoints}
+        while not self._server_shutdown:
+            for endpoint in self.endpoints:
+                self._manage_coordinators_endpoint(endpoint, first[endpoint])
+                first[endpoint] = False
+                self._check_daemon()
+                sleep(GUARD_CHECK_INTERVAL)
 
     def _halt(self):
         """Graceful shutdown."""
@@ -323,6 +351,14 @@ class Server:
         ), f"{type(proc)} is not a process or subprocess"
         self._daemon[name] = proc
 
+    def route(self, path: str = "/inference"):
+        """Generate a route to append worker by same way.
+
+        Args:
+            path: the path of added route
+        """
+        return Route(path, self)
+
     # pylint: disable=too-many-arguments
     def append_worker(
         self,
@@ -350,18 +386,30 @@ class Server:
             timeout: the timeout (second) for each worker forward processing (>=1)
         """
         self._validate_arguments(
-            worker, num, max_batch_size, max_wait_time, start_method, env, timeout
+            self.route_path,
+            worker,
+            num,
+            max_batch_size,
+            max_wait_time,
+            start_method,
+            env,
+            timeout,
         )
-        self._worker_cls.append(worker)
-        self._worker_num.append(num)
-        self._worker_mbs.append(max_batch_size)
-        self._worker_wait.append(max_wait_time)
-        self._worker_timeout.append(
+        if self.route_path not in self._worker_cls:
+            self.endpoints.append(self.route_path)
+
+        self._worker_cls.setdefault(self.route_path, []).append(worker)
+        self._worker_num.setdefault(self.route_path, []).append(num)
+        self._worker_mbs.setdefault(self.route_path, []).append(max_batch_size)
+        self._worker_wait.setdefault(self.route_path, []).append(max_wait_time)
+        self._worker_timeout.setdefault(self.route_path, []).append(
             timeout if timeout >= 1 else self._configs["timeout"] // 1000
         )
-        self._coordinator_env.append(env)
-        self._coordinator_ctx.append(start_method)
-        self._coordinator_pools.append([None] * num)
+        self._coordinator_env.setdefault(self.route_path, []).append(env)
+        self._coordinator_ctx.setdefault(self.route_path, []).append(start_method)
+        self._coordinator_pools.setdefault(self.route_path, []).append([None] * num)
+
+        self.route_path = DEFAULT_ROUTE
 
     def run(self):
         """Start the mosec model server."""

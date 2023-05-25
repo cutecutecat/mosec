@@ -78,20 +78,28 @@ class DryRunner:
     will be used.
     """
 
+    # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
-        workers: List[type[Worker]],
-        batches: List[int],
-        envs: List[None | List[Dict[str, str]]],
+        workers: Dict[str, List[type[Worker]]],
+        batches: Dict[str, List[int]],
+        envs: Dict[str, List[None | List[Dict[str, str]]]],
     ):
         """Init dry runner."""
         logger.info("init dry runner for %s", workers)
         self.process_context = SpawnContext()
+        self.endpoints = workers.keys()
         self.workers = workers
-        self.process_args = zip(workers, batches, envs)
-        self.pool: List[SpawnProcess] = []
-        self.sender_pipes: List[PipeConnection] = []
-        self.receiver_pipes: List[PipeConnection] = []
+        self.process_args = {
+            e: zip(workers[e], batches[e], envs[e]) for e in self.endpoints
+        }
+        self.pool: Dict[str, List[SpawnProcess]] = {e: [] for e in self.endpoints}
+        self.sender_pipes: Dict[str, List[PipeConnection]] = {
+            e: [] for e in self.endpoints
+        }
+        self.receiver_pipes: Dict[str, List[PipeConnection]] = {
+            e: [] for e in self.endpoints
+        }
 
         self.event: Event = self.process_context.Event()
         signal.signal(signal.SIGTERM, self.terminate)
@@ -102,34 +110,35 @@ class DryRunner:
         logger.info("received terminate signal [%s] %s", signum, framestack)
         self.event.set()
 
-    def new_pipe(self):
+    def new_pipe(self, endpoint: str):
         """Create new pipe for dry run workers to communicate."""
         receiver, sender = self.process_context.Pipe(duplex=False)
-        self.sender_pipes.append(sender)
-        self.receiver_pipes.append(receiver)
+        self.sender_pipes[endpoint].append(sender)
+        self.receiver_pipes[endpoint].append(receiver)
 
     def run(self):
         """Execute thr dry run process."""
-        self.new_pipe()
-        for i, (worker, batch, env) in enumerate(self.process_args):
-            self.new_pipe()
-            coordinator = self.process_context.Process(
-                target=dry_run_func,
-                args=(
-                    worker,
-                    batch,
-                    self.receiver_pipes[-2],
-                    self.sender_pipes[-1],
-                    i == 0,
-                    self.event,
-                ),
-                daemon=True,
-            )
+        for endpoint in self.endpoints:
+            self.new_pipe(endpoint)
+            for i, (worker, batch, env) in enumerate(self.process_args[endpoint]):
+                self.new_pipe(endpoint)
+                coordinator = self.process_context.Process(
+                    target=dry_run_func,
+                    args=(
+                        worker,
+                        batch,
+                        self.receiver_pipes[endpoint][-2],
+                        self.sender_pipes[endpoint][-1],
+                        i == 0,
+                        self.event,
+                    ),
+                    daemon=True,
+                )
 
-            with env_var_context(env, 0):
-                coordinator.start()
+                with env_var_context(env, 0):
+                    coordinator.start()
 
-            self.pool.append(coordinator)
+                self.pool[endpoint].append(coordinator)
 
         logger.info("dry run init successful")
         self.warmup()
@@ -137,15 +146,16 @@ class DryRunner:
         logger.info("wait for worker init done")
         if not self.event.is_set():
             self.event.set()
-        for i, process in enumerate(self.pool):
-            process.join()
-            if process.exitcode != 0:
-                logger.warning(
-                    "detect abnormal exit code %d in %s",
-                    process.exitcode,
-                    self.workers[i],
-                )
-                sys.exit(process.exitcode)
+        for endpoint in self.endpoints:
+            for i, process in enumerate(self.pool[endpoint]):
+                process.join()
+                if process.exitcode != 0:
+                    logger.warning(
+                        "detect abnormal exit code %d in %s",
+                        process.exitcode,
+                        self.workers[endpoint][i],
+                    )
+                    sys.exit(process.exitcode)
         logger.info("dry run exit")
 
     def warmup(self):
@@ -154,49 +164,58 @@ class DryRunner:
         If neither `example` nor `multi_examples` is provided, it will only
         init the worker class.
         """
-        ingress = self.workers[0]
-        example = None
-        if ingress.example:
-            example = ingress.example
-        elif ingress.multi_examples:
-            assert isinstance(ingress.multi_examples, list), (
-                "`multi_examples` " "should be a list of data"
+        for endpoint in self.endpoints:
+            ingress = self.workers[endpoint][0]
+            example = None
+            if ingress.example:
+                example = ingress.example
+            elif ingress.multi_examples:
+                assert isinstance(ingress.multi_examples, list), (
+                    "`multi_examples` " "should be a list of data"
+                )
+                example = ingress.multi_examples[0]
+
+            if not example:
+                logger.info(
+                    "cannot find the example in the 1st stage worker, skip warmup"
+                )
+                return
+
+            sender, receiver = (
+                self.sender_pipes[endpoint][0],
+                self.receiver_pipes[endpoint][-1],
             )
-            example = ingress.multi_examples[0]
+            start_time = time.perf_counter()
+            sender.send(example)
 
-        if not example:
-            logger.info("cannot find the example in the 1st stage worker, skip warmup")
-            return
-
-        sender, receiver = self.sender_pipes[0], self.receiver_pipes[-1]
-        start_time = time.perf_counter()
-        sender.send(example)
-
-        while not self.event.is_set():
-            if receiver.poll(0.1):
-                break
-
-            # liveness probe
-            for i, process in enumerate(self.pool):
-                if process.exitcode is not None:
-                    logger.warning(
-                        "worker %s exit with code %d", self.workers[i], process.exitcode
-                    )
-                    self.event.set()
+            while not self.event.is_set():
+                if receiver.poll(0.1):
                     break
 
-        if self.event.is_set():
-            sys.exit(1)
+                # liveness probe
+                for endpoint in self.endpoints:
+                    for i, process in enumerate(self.pool):
+                        if process.exitcode is not None:
+                            logger.warning(
+                                "worker %s exit with code %d",
+                                self.workers[endpoint][i],
+                                process.exitcode,
+                            )
+                            self.event.set()
+                            break
 
-        res = receiver.recv_bytes()
-        duration = time.perf_counter() - start_time
-        logger.info(
-            "dry run result: %s",
-            json.dumps(
-                {
-                    "request": example,
-                    "result_size": len(res),
-                    "warmup_duration": duration,
-                }
-            ),
-        )
+            if self.event.is_set():
+                sys.exit(1)
+
+            res = receiver.recv_bytes()
+            duration = time.perf_counter() - start_time
+            logger.info(
+                "dry run result: %s",
+                json.dumps(
+                    {
+                        "request": example,
+                        "result_size": len(res),
+                        "warmup_duration": duration,
+                    }
+                ),
+            )
