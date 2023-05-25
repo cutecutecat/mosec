@@ -194,7 +194,7 @@ class DryRunner:
 
                 # liveness probe
                 for endpoint in self.endpoints:
-                    for i, process in enumerate(self.pool):
+                    for i, process in enumerate(self.pool[endpoint]):
                         if process.exitcode is not None:
                             logger.warning(
                                 "worker %s exit with code %d",

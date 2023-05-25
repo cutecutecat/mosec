@@ -46,7 +46,7 @@ impl Coordinator {
     ) -> Self {
         let wait_time = waits.iter().map(|x| Duration::from_millis(*x)).collect();
         let path = if !path.is_empty() {
-            path.to_string()
+            path
         } else {
             // default IPC path
             std::env::temp_dir()
@@ -57,9 +57,9 @@ impl Coordinator {
         };
 
         Self {
-            capacity: capacity,
+            capacity,
             path,
-            batches: batches,
+            batches,
             wait_time,
             receiver,
             sender,

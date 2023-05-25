@@ -193,7 +193,7 @@ fn init_global(
     let metrics = Metrics::init_with_namespace(&opts.namespace, opts.timeout);
     METRICS.set(metrics).unwrap();
 
-    return (senders, receivers);
+    (senders, receivers)
 }
 
 #[tokio::main]

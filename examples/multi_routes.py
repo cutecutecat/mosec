@@ -16,27 +16,34 @@
 from typing import Any, Dict, List
 
 from mosec import Server, Worker
-from mosec.mixin.msgpack_worker import MsgpackMixin
 
 
 class Preprocess(Worker):
+    """Sample Class."""
+
     def forward(self, data: Dict[str, int]) -> int:
         num = int(data.get("num", 10))
         return num
 
 
 class Even(Worker):
+    """Sample Class."""
+
     def forward(self, data: List[int]) -> List[bool]:
         res = [d % 2 == 0 for d in data]
         return res
 
 
 class Next(Worker):
+    """Sample Class."""
+
     def forward(self, data: int) -> Dict[str, int]:
         return {"ans": data + 1}
 
 
 class Ping(Worker):
+    """Sample Class."""
+
     def forward(self, _data: Any) -> str:
         return "ok"
 

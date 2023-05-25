@@ -19,7 +19,7 @@ use std::{
 
 use argh::FromArgs;
 use derive_more::FromStr;
-use once_cell::unsync::Lazy;
+use once_cell::sync::Lazy;
 
 use crate::errors::SystemError;
 
@@ -28,20 +28,20 @@ pub(crate) struct Endpoint(String);
 
 impl Endpoint {
     pub(crate) fn new(path: &str) -> Endpoint {
-        return Endpoint(path.to_string());
+        Endpoint(path.to_string())
     }
 
     pub(crate) fn standardize_to_socket(&self, stage: impl Display) -> String {
-        let standard_path = self.0.clone().trim_matches('/').replace("/", "+");
-        return format!("ipc_{}_{}.socket", standard_path, stage);
+        let standard_path = self.0.clone().trim_matches('/').replace('/', "+");
+        format!("ipc_{}_{}.socket", standard_path, stage)
     }
 
     pub(crate) fn path(&self) -> &str {
-        return &self.0;
+        &self.0
     }
 }
 
-const RESERVED_ROUTEE: Lazy<HashSet<Endpoint>> =
+static RESERVED_ROUTE: Lazy<HashSet<Endpoint>> =
     Lazy::new(|| HashSet::from([Endpoint::new("/"), Endpoint::new("/metrics")]));
 
 #[derive(FromArgs, Debug, PartialEq)]
@@ -109,7 +109,7 @@ pub(crate) struct Opts {
 impl Opts {
     pub(crate) fn validate(&self) -> Result<(), SystemError> {
         for r in self.endpoints.iter() {
-            if RESERVED_ROUTEE.contains(&r) {
+            if RESERVED_ROUTE.contains(r) {
                 return Err(SystemError::ArgsValidationFailed {
                     msg: format!(
                         "endpoints and stages array should have same length, but {} != {}",
@@ -152,7 +152,7 @@ impl Opts {
                 msg: format!("stages array convert to u32 failed, {:#?}", self.stages,),
             });
         }
-        return Ok(());
+        Ok(())
     }
 
     pub(crate) fn devide_into_endpoints(&self) -> HashMap<Endpoint, (Vec<u32>, Vec<u64>)> {
@@ -164,6 +164,6 @@ impl Opts {
             let sub_waits = self.waits[batch_ind..batch_ind + stages].to_vec();
             endpoint_opts.insert(e.clone(), (sub_batches, sub_waits));
         }
-        return endpoint_opts;
+        endpoint_opts
     }
 }

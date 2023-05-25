@@ -67,7 +67,7 @@ logger = get_internal_logger()
 GUARD_CHECK_INTERVAL = 1
 NEW_PROCESS_METHOD = {"spawn", "fork"}
 DEFAULT_ROUTE = "/inference"
-RESERVED_ROUTEE = set(["/", "/metrics"])
+RESERVED_ROUTE = set(["/", "/metrics"])
 
 
 class Server:
@@ -136,7 +136,7 @@ class Server:
     ):
         def validate_route():
             assert (
-                endpoint not in RESERVED_ROUTEE
+                endpoint not in RESERVED_ROUTE
             ), f"{endpoint} is reserved, change to another one"
 
         def validate_int_ge(number, name, threshold=1):
